@@ -1,5 +1,8 @@
 schema_version = "1.3"
 
+[task]
+name = "huey-atomic-schedule"
+
 [metadata]
 name = "huey-atomic-schedule"
 description = "Repair durable, atomic scheduled-task promotion in Huey's SQLite backend."
