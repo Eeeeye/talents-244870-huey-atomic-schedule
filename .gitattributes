@@ -1,0 +1,3 @@
+# Preserve vendored upstream formatting and unified-diff context lines.
+environment/huey/** -whitespace conflict-marker-size=32
+solution/*.patch -whitespace

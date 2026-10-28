@@ -1,0 +1,495 @@
+"""Independent behavioral checks for durable schedule promotion.
+
+Faults are injected at SQLite's boundary and durable state is observed with
+separate connections. No reference implementation is imported or inspected.
+"""
+import contextlib
+import datetime as dt
+import importlib
+import logging
+import multiprocessing as mp
+import os
+from pathlib import Path
+import random
+import signal
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+
+# Huey's naive scheduling datetimes follow the local timezone before UTC
+# normalization. Use the same explicit timezone in all spawned test processes.
+os.environ['TZ'] = 'UTC'
+time.tzset()
+sys.dont_write_bytecode = True
+
+SOURCE = Path(os.environ.get('TASK_SOURCE', '/app/huey')).resolve()
+sys.path.insert(0, str(SOURCE))
+from huey import MemoryHuey, SqliteHuey
+from huey.consumer import Scheduler
+from huey.serializer import Serializer
+from huey.signals import SIGNAL_ENQUEUED
+
+NOW = dt.datetime(2025, 3, 8, 12, 30, 15)
+CTX = mp.get_context('spawn')
+
+
+class CaseTimeout(BaseException):
+    """Cannot be swallowed by application-level exception isolation."""
+
+
+def echo(value=None, **kwargs):
+    return value, kwargs
+
+# Stable registry module name across spawn and unittest execution.
+echo.__module__ = 'promotion_fixture'
+
+
+def register(huey):
+    return huey.task(name='echo')(echo)
+
+
+def make_huey(path, name='main', **kwargs):
+    huey = SqliteHuey(name, filename=str(path), strict_fifo=True, timeout=3,
+                     **kwargs)
+    return huey, register(huey)
+
+
+def snapshot(path):
+    with sqlite3.connect(str(path), timeout=3) as conn:
+        return {table: conn.execute('SELECT * FROM ' + table + ' ORDER BY 1,2').fetchall()
+                for table in ('schedule', 'task', 'kv', 'counter')}
+
+
+def rows(path, table, queue='main'):
+    order = 'timestamp,id' if table == 'schedule' else 'priority DESC,id'
+    with sqlite3.connect(str(path), timeout=3) as conn:
+        return conn.execute('SELECT data FROM %s WHERE queue=? ORDER BY %s' %
+                            (table, order), (queue,)).fetchall()
+
+
+def task_ids(huey, path, table='task', queue='main'):
+    return [huey.deserialize_task(data).id for data, in rows(path, table, queue)]
+
+
+def add_batch(huey, task, count, prefix='job', seed=7301):
+    rng = random.Random(seed)
+    selected = []
+    for i in range(count):
+        eta = NOW - dt.timedelta(seconds=rng.randrange(7))
+        priority = rng.choice([None, -9, -0.5, 0, 0.25, 6, 101])
+        item = task.s({'index': i, 'nonce': rng.randrange(2**40)},
+                      id='%s-%d' % (prefix, i), eta=eta, priority=priority)
+        huey.add_schedule(item)
+        selected.append((eta, i, item))
+    return [item for _, _, item in sorted(selected, key=lambda x: x[:2])]
+
+
+def new_database(path):
+    # The unmodified release's on-disk schema, independently provisioned.
+    with sqlite3.connect(str(path)) as conn:
+        conn.executescript('''
+          PRAGMA journal_mode=WAL;
+          CREATE TABLE kv (queue TEXT NOT NULL,key TEXT NOT NULL,value BLOB NOT NULL,PRIMARY KEY(queue,key));
+          CREATE TABLE schedule (id INTEGER NOT NULL PRIMARY KEY,queue TEXT NOT NULL,data BLOB NOT NULL,timestamp REAL NOT NULL);
+          CREATE INDEX schedule_queue_timestamp ON schedule(queue,timestamp);
+          CREATE TABLE task (id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,queue TEXT NOT NULL,data BLOB NOT NULL,priority REAL NOT NULL DEFAULT 0.0);
+          CREATE INDEX task_queue_priority_id ON task(queue,priority DESC,id);
+          CREATE TABLE counter(queue TEXT NOT NULL,key TEXT NOT NULL,value INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(queue,key));
+        ''')
+
+
+@contextlib.contextmanager
+def configure_connections(huey, configure):
+    """Apply a real SQLite fault to current and newly opened connections."""
+    original = sqlite3.connect
+    connections = [huey.storage.conn]
+    configure(connections[0])
+
+    def connect(*args, **kwargs):
+        conn = original(*args, **kwargs)
+        configure(conn)
+        connections.append(conn)
+        return conn
+
+    try:
+        with mock.patch.object(sqlite3, 'connect', connect):
+            yield
+    finally:
+        for conn in connections:
+            try:
+                conn.set_authorizer(None)
+            except sqlite3.Error:
+                pass
+
+
+def promote_worker(path, start, output):
+    try:
+        h, _ = make_huey(path)
+        start.wait(5)
+        count = h.promote_schedule(NOW)
+        output.put(('ok', count))
+        h.storage.close()
+    except BaseException as exc:
+        output.put(('error', type(exc).__name__ + ': ' + str(exc)))
+
+
+def crash_worker(path, reached):
+    h, _ = make_huey(path)
+
+    def stop_before_commit():
+        reached.set()
+        # Parent terminates this process while a real SQLite statement runs.
+        time.sleep(30)
+        return 0
+
+    with configure_connections(h, lambda c: c.create_function('promotion_gate', 0, stop_before_commit)):
+        h.promote_schedule(NOW)
+
+
+class FramedSerializer(Serializer):
+    def __init__(self):
+        super().__init__(compression=True)
+        self.fail_encoding = False
+
+    def serialize(self, message):
+        if self.fail_encoding and message.id.endswith('-3'):
+            raise ValueError('serializer rejected selected task')
+        return b'framed-v1\0' + super().serialize(message)
+
+    def deserialize(self, data):
+        if not data.startswith(b'framed-v1\0'):
+            raise ValueError('missing serializer frame')
+        return super().deserialize(data[len(b'framed-v1\0'):])
+
+
+class PromotionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='promotion-case-')
+        self.path = Path(self.temp.name) / 'existing broker.sqlite'
+        new_database(self.path)
+        self.h, self.task = make_huey(self.path)
+        self.connections = [self.h]
+        self.children = []
+        self.previous_alarm = signal.signal(signal.SIGALRM, self.timeout)
+        signal.alarm(18)
+
+    def timeout(self, *_):
+        raise CaseTimeout('behavioral case exceeded 18 seconds (possible storage deadlock)')
+
+    def tearDown(self):
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, self.previous_alarm)
+        for child in self.children:
+            if child.is_alive():
+                child.kill()
+            child.join(2)
+        for h in self.connections:
+            # A failed deadlock check can leave the connection locked; do not
+            # reacquire its Python lock during cleanup.
+            conn = getattr(h.storage, '_conn', None)
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
+        self.temp.cleanup()
+
+    def events(self):
+        events = []
+        self.h.signal(SIGNAL_ENQUEUED)(lambda signal_name, task: events.append(task.id))
+        return events
+
+    def seed_preserved(self):
+        self.h.enqueue(self.task.s('already-ready', id='already-ready', priority=200))
+        # TaskWrapper.s() normalizes eta to whole seconds. The contract is
+        # defined by the stored timestamp, so seed the subsecond boundary
+        # directly rather than accidentally turning this row into a due job.
+        future_time = NOW + dt.timedelta(microseconds=1)
+        future = self.task.s('future', id='future')
+        future.eta = future_time
+        self.h.storage.add_to_schedule(self.h.serialize_task(future), future_time)
+        other, other_task = make_huey(self.path, name='another queue')
+        self.connections.append(other)
+        other.add_schedule(other_task.s('foreign-due', id='foreign-due', eta=NOW))
+        other.enqueue(other_task.s('foreign-ready', id='foreign-ready'))
+        self.h.storage.put_data('retained-result', b'result-value', is_result=True)
+        self.h.revoke_by_id('revoked-opaque-id', revoke_once=True)
+        self.h.storage.incr('retained-counter', 19)
+        return snapshot(self.path)
+
+    def assert_promoted(self, expected, count):
+        result = self.h.promote_schedule(NOW)
+        self.assertIs(type(result), int)
+        self.assertEqual(result, count)
+        actual = task_ids(self.h, self.path)
+        self.assertCountEqual(actual, [task.id for task in expected])
+        return actual
+
+    def test_boundaries_order_priorities_and_existing_database(self):
+        self.assertEqual(self.h.promote_schedule(NOW), 0)
+        preserved = self.seed_preserved()
+        selected = add_batch(self.h, self.task, 509, seed=662941)
+        boundary = self.task.s('boundary', id='at-boundary', eta=NOW, priority=0)
+        self.h.storage.add_to_schedule(self.h.serialize_task(boundary), NOW)
+        selected.append(boundary)
+        events = self.events()
+        self.assertEqual(self.h.promote_schedule(NOW), 510)
+        expected = ['already-ready'] + [t.id for t in sorted(selected, key=lambda t: -(t.priority or 0))]
+        self.assertEqual(task_ids(self.h, self.path), expected)
+        self.assertEqual(events, [t.id for t in selected])
+        after = snapshot(self.path)
+        self.assertEqual(after['schedule'], preserved['schedule'])
+        self.assertEqual(after['kv'], preserved['kv'])
+        self.assertEqual(after['counter'], preserved['counter'])
+        self.assertEqual([r for r in after['task'] if r[1] == 'another queue'],
+                         [r for r in preserved['task'] if r[1] == 'another queue'])
+        self.assertEqual(self.h.promote_schedule(NOW), 0)
+        self.assertEqual(len(events), 510)
+
+    def test_duplicate_rows_and_metadata_survive(self):
+        expires = dt.datetime(2035, 6, 7, 8, 9)
+        t = self.task.s({'nested': [1, 'x', b'opaque']}, flag=False,
+                       id='duplicate-id', eta=NOW, retries=7, retry_delay=13,
+                       retry_backoff=2, priority=-3.75, expires=expires, timeout=19)
+        t.on_complete = self.task.s('chain', id='next-step', priority=8)
+        t.on_error = self.task.s('recover', id='error-step', retries=2)
+        for _ in range(3):
+            self.h.add_schedule(t)
+        events = self.events()
+        self.assertEqual(self.h.promote_schedule(NOW), 3)
+        ready = [self.h.deserialize_task(data) for data, in rows(self.path, 'task')]
+        self.assertEqual(len(ready), 3)
+        for item in ready:
+            for attr in ('id', 'args', 'kwargs', 'eta', 'retries', 'retry_delay',
+                         'retry_backoff', 'priority', 'expires', 'timeout'):
+                self.assertEqual(getattr(item, attr), getattr(t, attr), attr)
+            self.assertEqual(item.expires_resolved, expires)
+            self.assertEqual(item.on_complete.id, 'next-step')
+            self.assertEqual(item.on_complete.args, ('chain',))
+            self.assertEqual(item.on_error.id, 'error-step')
+            self.assertEqual(item.on_error.retries, 2)
+        self.assertEqual(events, ['duplicate-id'] * 3)
+
+    def test_omitted_timestamp_and_relative_expiration(self):
+        current = self.h._get_timestamp()
+        self.h.add_schedule(self.task.s('due', eta=current - dt.timedelta(days=1),
+                                       id='relative-expiry', expires=120))
+        self.h.add_schedule(self.task.s('future', eta=current + dt.timedelta(days=1), id='future'))
+        before = self.h._get_timestamp()
+        self.assertEqual(self.h.promote_schedule(), 1)
+        after = self.h._get_timestamp()
+        ready = self.h.deserialize_task(rows(self.path, 'task')[0][0])
+        self.assertGreaterEqual(ready.expires_resolved, before + dt.timedelta(seconds=120))
+        self.assertLessEqual(ready.expires_resolved, after + dt.timedelta(seconds=120))
+        self.assertEqual(task_ids(self.h, self.path, 'schedule'), ['future'])
+
+    def test_insert_failure_rolls_back_entire_large_batch_and_retries(self):
+        self.seed_preserved()
+        selected = add_batch(self.h, self.task, 507)
+        before = snapshot(self.path)
+        events = self.events()
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('''CREATE TRIGGER injected_insert BEFORE INSERT ON task
+              WHEN NEW.queue='main' AND (SELECT count(*) FROM task WHERE queue='main') >= 503
+              BEGIN SELECT RAISE(ABORT, 'queue write rejected'); END''')
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER injected_insert')
+        self.assertEqual(self.h.promote_schedule(NOW), 507)
+        self.assertCountEqual(task_ids(self.h, self.path), ['already-ready'] + [t.id for t in selected])
+
+    def test_delete_failure_rolls_back_ready_writes(self):
+        selected = add_batch(self.h, self.task, 31)
+        before = snapshot(self.path)
+        events = self.events()
+        target = before['schedule'][17][0]
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('''CREATE TRIGGER injected_delete BEFORE DELETE ON schedule
+              WHEN OLD.id=%d BEGIN SELECT RAISE(ABORT, 'schedule removal rejected'); END''' % target)
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER injected_delete')
+        self.assert_promoted(selected, 31)
+
+    def test_commit_failure_rolls_back_and_connection_remains_usable(self):
+        selected = add_batch(self.h, self.task, 13)
+        before = snapshot(self.path)
+        events = self.events()
+        denied = []
+
+        def authorizer(action, first, second, db, source):
+            if action == sqlite3.SQLITE_TRANSACTION and first == 'COMMIT':
+                denied.append(first)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        with configure_connections(self.h, lambda c: c.set_authorizer(authorizer)):
+            with self.assertRaises(Exception):
+                self.h.promote_schedule(NOW)
+        self.assertTrue(denied, 'fault must reach a real SQLite COMMIT')
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        self.assert_promoted(selected, 13)
+
+    def test_malformed_due_payload_is_recoverable(self):
+        add_batch(self.h, self.task, 7)
+        self.h.storage.add_to_schedule(b'not-a-pickled-message', NOW - dt.timedelta(seconds=3))
+        before = snapshot(self.path)
+        events = self.events()
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        replacement = self.h.serialize_task(self.task.s('repaired', id='repaired', eta=NOW))
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('UPDATE schedule SET data=? WHERE data=?', (replacement, b'not-a-pickled-message'))
+        self.assertEqual(self.h.promote_schedule(NOW), 8)
+
+    def test_unregistered_task_rolls_back_until_registered(self):
+        add_batch(self.h, self.task, 4)
+        special = self.h.task(name='register-later')(echo)
+        self.h.add_schedule(special.s('recoverable', id='unknown-until-repaired', eta=NOW))
+        special.unregister()
+        before = snapshot(self.path)
+        events = self.events()
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        self.h.task(name='register-later')(echo)
+        self.assertEqual(self.h.promote_schedule(NOW), 5)
+
+    def test_custom_serializer_encode_failure_and_recovery(self):
+        serializer = FramedSerializer()
+        self.h.serializer = serializer
+        selected = add_batch(self.h, self.task, 8, prefix='frame')
+        before = snapshot(self.path)
+        events = self.events()
+        serializer.fail_encoding = True
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(events, [])
+        serializer.fail_encoding = False
+        self.assert_promoted(selected, 8)
+        self.assertTrue(all(data.startswith(b'framed-v1\0') for data, in rows(self.path, 'task')))
+
+    def test_signals_are_postcommit_reentrant_and_failure_isolated(self):
+        selected = add_batch(self.h, self.task, 9)
+        observations, seen, errors = [], [], []
+        extra = self.task.s('created-in-receiver', id='receiver-created', eta=NOW)
+
+        @self.h.signal(SIGNAL_ENQUEUED)
+        def receiver(signal_name, task):
+            try:
+                seen.append(task.id)
+                observations.append((self.h.storage.queue_size(), len(rows(self.path, 'task'))))
+                if len(seen) == 1:
+                    self.h.add_schedule(extra)
+            except BaseException as exc:
+                errors.append(repr(exc))
+                raise
+
+        @self.h.signal(SIGNAL_ENQUEUED)
+        def failing_receiver(signal_name, task):
+            raise RuntimeError('receiver deliberately failed')
+
+        with self.assertLogs('huey', level='ERROR'):
+            self.assertEqual(self.h.promote_schedule(NOW), 9)
+        self.assertEqual(errors, [])
+        self.assertEqual(observations, [(9, 9)] * 9)
+        self.assertEqual(seen, [t.id for t in selected])
+        self.assertEqual(task_ids(self.h, self.path, 'schedule'), ['receiver-created'])
+        with self.assertLogs('huey', level='ERROR'):
+            self.assertEqual(self.h.promote_schedule(NOW), 1)
+        self.assertEqual(seen[-1], 'receiver-created')
+
+    def test_concurrent_processes_claim_each_row_once(self):
+        selected = add_batch(self.h, self.task, 613, seed=91873)
+        start, output = CTX.Event(), CTX.Queue()
+        self.h.storage.close()
+        self.children = [CTX.Process(target=promote_worker, args=(str(self.path), start, output)) for _ in range(3)]
+        for child in self.children:
+            child.start()
+        start.set()
+        results = [output.get(timeout=8) for _ in self.children]
+        for child in self.children:
+            child.join(3)
+            self.assertEqual(child.exitcode, 0)
+        self.assertTrue(all(kind == 'ok' for kind, value in results), results)
+        self.assertEqual(sum(value for kind, value in results), len(selected))
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected])
+        self.assertEqual(rows(self.path, 'schedule'), [])
+
+    def test_termination_before_commit_preserves_durable_state(self):
+        selected = add_batch(self.h, self.task, 27)
+        before = snapshot(self.path)
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('''CREATE TRIGGER precommit_pause AFTER INSERT ON task
+              WHEN NEW.queue='main' AND (SELECT count(*) FROM task WHERE queue='main')=5
+              BEGIN SELECT promotion_gate(); END''')
+        self.h.storage.close()
+        reached = CTX.Event()
+        child = CTX.Process(target=crash_worker, args=(str(self.path), reached))
+        self.children = [child]
+        child.start()
+        self.assertTrue(reached.wait(8), 'process did not reach the real in-transaction fault point')
+        child.kill()
+        child.join(3)
+        self.assertEqual(child.exitcode, -signal.SIGKILL)
+        self.assertEqual(snapshot(self.path), before)
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER precommit_pause')
+        self.assert_promoted(selected, 27)
+
+    def test_scheduler_logs_failed_promotion_then_recovers_and_runs_periodic(self):
+        selected = add_batch(self.h, self.task, 5)
+        before = snapshot(self.path)
+        stop = threading.Event()
+        stop.set()
+        scheduler = Scheduler(self.h, stop, 1, False)
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('''CREATE TRIGGER consumer_fault BEFORE INSERT ON task
+              BEGIN SELECT RAISE(ABORT, 'consumer queue unavailable'); END''')
+        with self.assertLogs('huey.consumer', level='ERROR'):
+            scheduler.loop(now=NOW)
+        self.assertEqual(snapshot(self.path), before)
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER consumer_fault')
+        scheduler.loop(now=NOW)
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected])
+        periodic = self.h.periodic_task(lambda timestamp: True, name='periodic')(echo)
+        scheduler.periodic = True
+        scheduler._next_periodic = time.monotonic() - 1
+        scheduler.loop(now=NOW)
+        ready = [self.h.deserialize_task(data) for data, in rows(self.path, 'task')]
+        self.assertEqual(sum(type(t).__name__ == periodic.task_class.__name__ for t in ready), 1)
+
+    def test_legacy_destructive_read_and_memory_backend(self):
+        selected = add_batch(self.h, self.task, 6)
+        self.h.add_schedule(self.task.s('future', id='future', eta=NOW + dt.timedelta(seconds=1)))
+        self.assertEqual([t.id for t in self.h.read_schedule(NOW)], [t.id for t in selected])
+        self.assertEqual(rows(self.path, 'task'), [])
+        self.assertEqual(task_ids(self.h, self.path, 'schedule'), ['future'])
+        self.h.storage.add_to_schedule(b'raw-storage-value', NOW)
+        self.assertEqual(self.h.storage.read_schedule(NOW), [b'raw-storage-value'])
+        memory = MemoryHuey('memory')
+        memory_task = register(memory)
+        memory.add_schedule(memory_task.s('x', id='memory-due', eta=NOW))
+        memory.add_schedule(memory_task.s('y', id='memory-future', eta=NOW + dt.timedelta(seconds=1)))
+        self.assertEqual(memory.promote_schedule(NOW), 1)
+        self.assertEqual(memory.dequeue().id, 'memory-due')
+        self.assertEqual(memory.promote_schedule(NOW), 0)
+        self.assertEqual([t.id for t in memory.read_schedule(NOW + dt.timedelta(seconds=1))], ['memory-future'])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

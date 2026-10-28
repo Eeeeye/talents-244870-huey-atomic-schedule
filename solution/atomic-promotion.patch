@@ -1,0 +1,97 @@
+--- a/huey/api.py
++++ b/huey/api.py
+@@ -751,6 +751,32 @@
+             timestamp = self._get_timestamp()
+         return self._deserialize_all(self.storage.read_schedule(timestamp))
+ 
++    def promote_schedule(self, timestamp=None):
++        """Enqueue due scheduled tasks and return the number promoted.
++
++        SQLite transfers the entire batch atomically, including preparation
++        of each serialized task. Other backends retain their existing
++        destructive-read/enqueue behavior.
++        """
++        if timestamp is None:
++            timestamp = self._get_timestamp()
++        if not isinstance(self.storage, SqliteStorage):
++            tasks = self.read_schedule(timestamp)
++            for task in tasks:
++                self.enqueue(task)
++            return len(tasks)
++
++        def prepare(data):
++            task = self.deserialize_task(data)
++            if task.expires:
++                task.resolve_expires(self.utc)
++            return task, self.serialize_task(task), task.priority
++
++        tasks = self.storage._promote_schedule(timestamp, prepare)
++        for task in tasks:
++            self._emit(S.SIGNAL_ENQUEUED, task)
++        return len(tasks)
++
+     def _deserialize_all(self, messages):
+         accum = []
+         for msg in messages:
+--- a/huey/storage.py
++++ b/huey/storage.py
+@@ -858,11 +858,10 @@
+             try:
+                 if commit: cursor.execute(self.begin_sql)
+                 yield cursor
+-            except Exception:
++                if commit: conn.commit()
++            except BaseException:
+                 if commit: conn.rollback()
+                 raise
+-            else:
+-                if commit: conn.commit()
+             finally:
+                 cursor.close()
+                 if close:
+@@ -1002,6 +1001,27 @@
+                              ','.join('?' * len(chunk)), chunk)
+             return data
+ 
++    def _promote_schedule(self, ts, prepare):
++        """Move due rows with their prepared payloads in one transaction.
++
++        ``prepare`` performs the caller's decoding and encoding before any
++        durable mutation. The returned objects are used only after commit;
++        notifications must never run while the storage lock is held.
++        """
++        with self.db(commit=True) as curs:
++            curs.execute('select id, data from schedule where '
++                         'queue = ? and timestamp <= ? order by timestamp, id',
++                         (self.name, ts.timestamp()))
++            rows = curs.fetchall()
++            prepared = [prepare(data) for _, data in rows]
++            curs.executemany(
++                'insert into task (queue, data, priority) values (?, ?, ?)',
++                [(self.name, self.to_blob(data), priority or 0)
++                 for _, data, priority in prepared])
++            curs.executemany('delete from schedule where queue = ? and id = ?',
++                             [(self.name, row_id) for row_id, _ in rows])
++        return [task for task, _, _ in prepared]
++
+     def schedule_size(self):
+         return self.sql('select count(id) from schedule where queue=?',
+                         (self.name,), results=True)[0][0]
+--- a/huey/consumer.py
++++ b/huey/consumer.py
+@@ -174,13 +174,9 @@
+             return
+ 
+         try:
+-            task_list = self.huey.read_schedule(now)
++            self.huey.promote_schedule(now)
+         except Exception:
+-            self._logger.exception('Error reading schedule.')
+-        else:
+-            for task in task_list:
+-                self._logger.debug('Enqueueing %s', task)
+-                self.huey.enqueue(task)
++            self._logger.exception('Error promoting scheduled tasks.')
+ 
+         if self.periodic and self._next_periodic <= time.monotonic():
+             # If the scheduler stalled (e.g. suspend/resume), skip past any
