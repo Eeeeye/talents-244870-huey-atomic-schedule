@@ -1,6 +1,6 @@
 --- a/huey/api.py
 +++ b/huey/api.py
-@@ -751,6 +751,32 @@
+@@ -751,6 +751,34 @@
              timestamp = self._get_timestamp()
          return self._deserialize_all(self.storage.read_schedule(timestamp))
  
@@ -25,9 +25,11 @@
 +                task.resolve_expires(self.utc)
 +            return task, self.serialize_task(task), task.priority
 +
-+        tasks = self.storage._promote_schedule(timestamp, prepare)
-+        for task in tasks:
-+            self._emit(S.SIGNAL_ENQUEUED, task)
++        def notify(tasks):
++            for task in tasks:
++                self._emit(S.SIGNAL_ENQUEUED, task)
++
++        tasks = self.storage._promote_schedule(timestamp, prepare, notify)
 +        return len(tasks)
 +
      def _deserialize_all(self, messages):
@@ -35,7 +37,21 @@
          for msg in messages:
 --- a/huey/storage.py
 +++ b/huey/storage.py
-@@ -858,11 +858,10 @@
+@@ -824,11 +824,12 @@
+ class BaseSqlStorage(BaseStorage):
+     begin_sql = 'begin'
+     ddl = []
++    lock_class = threading.Lock
+ 
+     def __init__(self, *args, **kwargs):
+         create_tables = kwargs.pop('create_tables', True)
+         super(BaseSqlStorage, self).__init__(*args, **kwargs)
+-        self.lock = threading.Lock()
++        self.lock = self.lock_class()
+         self._conn = None
+         if create_tables:
+             self.initialize_schema()
+@@ -858,11 +859,10 @@
              try:
                  if commit: cursor.execute(self.begin_sql)
                  yield cursor
@@ -49,11 +65,103 @@
              finally:
                  cursor.close()
                  if close:
-@@ -1002,6 +1001,27 @@
+@@ -883,6 +883,7 @@
+ 
+ class SqliteStorage(BaseSqlStorage):
+     begin_sql = 'begin exclusive'
++    lock_class = threading.RLock
+     integrity_error = getattr(sqlite3, 'IntegrityError', None)
+     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
+     table_kv = ('create table if not exists kv ('
+@@ -915,6 +916,11 @@
+         self._journal_mode = journal_mode
+         self._timeout = timeout  # Busy timeout in seconds, default is 5.
+         self._conn_kwargs = kwargs
++        self._db_depth = 0
++        self._write_scopes = []
++        self._savepoint_sequence = 0
++        self._close_requested = False
++        self._committed_callbacks = []
+ 
+         # By default Sqlite may reuse rowids when rows are removed. This means
+         # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
+@@ -932,6 +938,70 @@
+         self.to_blob = memoryview
+ 
+         super(SqliteStorage, self).__init__(name, create_tables=create_tables)
++
++    @contextlib.contextmanager
++    def db(self, commit=False, close=False):
++        # Hold one reentrant lock throughout the scope, so only this thread
++        # can use the connection or attach callbacks to its transaction.
++        callbacks = []
++        try:
++            with self.lock:
++                conn = self.conn
++                cursor = conn.cursor()
++                self._db_depth += 1
++                self._close_requested |= close
++                frame = None
++                savepoint = None
++                try:
++                    if commit:
++                        if self._write_scopes:
++                            self._savepoint_sequence += 1
++                            savepoint = 'huey_scope_%d' % self._savepoint_sequence
++                            cursor.execute('SAVEPOINT ' + savepoint)
++                        else:
++                            cursor.execute(self.begin_sql)
++                        frame = []
++                        self._write_scopes.append(frame)
++                    try:
++                        yield cursor
++                        if frame is not None:
++                            if savepoint is None:
++                                conn.commit()
++                            else:
++                                cursor.execute('RELEASE SAVEPOINT ' + savepoint)
++                    except BaseException:
++                        if frame is not None:
++                            if savepoint is None:
++                                conn.rollback()
++                            else:
++                                cursor.execute('ROLLBACK TO SAVEPOINT ' + savepoint)
++                                cursor.execute('RELEASE SAVEPOINT ' + savepoint)
++                        raise
++                    else:
++                        if frame is not None:
++                            if len(self._write_scopes) > 1:
++                                self._write_scopes[-2].extend(frame)
++                            else:
++                                self._committed_callbacks.extend(frame)
++                    finally:
++                        if frame is not None:
++                            self._write_scopes.pop()
++                finally:
++                    cursor.close()
++                    self._db_depth -= 1
++                    if not self._db_depth:
++                        if self._close_requested:
++                            self._close_requested = False
++                            conn.close()
++                            self._conn = None
++                        callbacks = self._committed_callbacks
++                        self._committed_callbacks = []
++        finally:
++            # Even a surrounding read-only scope may raise after a child
++            # committed. Those durable notifications must still be delivered.
++            # No storage lock or live transaction remains here.
++            for callback in callbacks:
++                callback()
+ 
+     def _create_connection(self):
+         conn = sqlite3.connect(self.filename, timeout=self._timeout,
+@@ -1001,6 +1071,29 @@
+                 curs.execute('delete from schedule where id in (%s)' %
                               ','.join('?' * len(chunk)), chunk)
              return data
- 
-+    def _promote_schedule(self, ts, prepare):
++
++    def _promote_schedule(self, ts, prepare, notify):
 +        """Move due rows with their prepared payloads in one transaction.
 +
 +        ``prepare`` performs the caller's decoding and encoding before any
@@ -72,11 +180,12 @@
 +                 for _, data, priority in prepared])
 +            curs.executemany('delete from schedule where queue = ? and id = ?',
 +                             [(self.name, row_id) for row_id, _ in rows])
-+        return [task for task, _, _ in prepared]
-+
++            tasks = [task for task, _, _ in prepared]
++            self._write_scopes[-1].append(lambda: notify(tasks))
++        return tasks
+ 
      def schedule_size(self):
          return self.sql('select count(id) from schedule where queue=?',
-                         (self.name,), results=True)[0][0]
 --- a/huey/consumer.py
 +++ b/huey/consumer.py
 @@ -174,13 +174,9 @@

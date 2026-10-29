@@ -28,7 +28,7 @@ sys.dont_write_bytecode = True
 
 SOURCE = Path(os.environ.get('TASK_SOURCE', '/app/huey')).resolve()
 sys.path.insert(0, str(SOURCE))
-from huey import MemoryHuey, SqliteHuey
+from huey import FileHuey, MemoryHuey, SqliteHuey
 from huey.consumer import Scheduler
 from huey.serializer import Serializer
 from huey.signals import SIGNAL_ENQUEUED
@@ -39,6 +39,10 @@ CTX = mp.get_context('spawn')
 
 class CaseTimeout(BaseException):
     """Cannot be swallowed by application-level exception isolation."""
+
+
+class AbortScope(BaseException):
+    """An application cancellation, distinct from the test deadline."""
 
 
 def echo(value=None, **kwargs):
@@ -178,7 +182,7 @@ class PromotionTests(unittest.TestCase):
         signal.alarm(18)
 
     def timeout(self, *_):
-        raise CaseTimeout('behavioral case exceeded 18 seconds (possible storage deadlock)')
+        raise CaseTimeout('behavioral case deadline exceeded (possible storage deadlock)')
 
     def tearDown(self):
         signal.alarm(0)
@@ -489,6 +493,260 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(memory.dequeue().id, 'memory-due')
         self.assertEqual(memory.promote_schedule(NOW), 0)
         self.assertEqual([t.id for t in memory.read_schedule(NOW + dt.timedelta(seconds=1))], ['memory-future'])
+
+    def test_nested_commit_visibility_and_notification_order(self):
+        signal.alarm(10)
+        first = add_batch(self.h, self.task, 7, prefix='first')
+        before = snapshot(self.path)
+        seen, observations = [], []
+
+        @self.h.signal(SIGNAL_ENQUEUED)
+        def observe(signal_name, task):
+            seen.append(task.id)
+            observations.append((self.h.storage.queue_size(), len(rows(self.path, 'task'))))
+
+        with self.h.storage.db(commit=True) as outer:
+            self.h.storage.put_data('outer-marker', b'preserved')
+            self.assertEqual(self.h.promote_schedule(NOW), 7)
+            self.assertEqual(self.h.promote_schedule(NOW), 0)
+            with self.h.storage.db(commit=False) as reader:
+                reader.execute('SELECT count(*) FROM task WHERE queue=?', ('main',))
+                self.assertEqual(reader.fetchone()[0], 7)
+            second = add_batch(self.h, self.task, 4, prefix='second')
+            with self.h.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 4)
+                self.h.storage.incr('nested-counter', 23)
+            self.assertEqual(self.h.storage.queue_size(), 11)
+            self.assertEqual(snapshot(self.path), before)
+            self.assertEqual(seen, [])
+            outer.execute('SELECT count(*) FROM schedule')
+            self.assertEqual(outer.fetchone()[0], 0)
+        self.assertEqual(seen, [t.id for t in first + second])
+        self.assertEqual(observations, [(11, 11)] * 11)
+        self.assertEqual(self.h.storage.peek_data('outer-marker'), b'preserved')
+        self.assertEqual(self.h.storage.incr('nested-counter', 0), 23)
+
+    def test_nested_rollback_keeps_parent_and_discards_only_its_notifications(self):
+        signal.alarm(10)
+        first = add_batch(self.h, self.task, 3, prefix='survives')
+        seen = self.events()
+        with self.h.storage.db(commit=True):
+            self.assertEqual(self.h.promote_schedule(NOW), 3)
+            later = add_batch(self.h, self.task, 5, prefix='retry')
+            self.h.storage.incr('outer-counter', 7)
+            try:
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(self.h.promote_schedule(NOW), 5)
+                    self.h.storage.incr('outer-counter', 100)
+                    with self.h.storage.db(commit=True):
+                        self.h.storage.put_data('rolled-back', b'discard')
+                    raise AbortScope('cancel inner unit of work')
+            except AbortScope:
+                pass
+            self.assertEqual(self.h.storage.queue_size(), 3)
+            self.assertEqual(self.h.storage.schedule_size(), 5)
+            self.assertEqual(self.h.storage.incr('outer-counter', 0), 7)
+            self.assertEqual(seen, [])
+            self.assertEqual(self.h.promote_schedule(NOW), 5)
+        self.assertEqual(seen, [t.id for t in first + later])
+        self.assertEqual(self.h.storage.incr('outer-counter', 0), 7)
+        self.assertFalse(any(r[1] == 'rolled-back' for r in snapshot(self.path)['kv']))
+
+    def test_outer_cancellation_restores_nested_promotions_and_notifications(self):
+        signal.alarm(10)
+        selected = add_batch(self.h, self.task, 9)
+        before = snapshot(self.path)
+        seen = self.events()
+        with self.assertRaises(AbortScope):
+            with self.h.storage.db(commit=True):
+                self.h.storage.incr('discard-counter', 31)
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(self.h.promote_schedule(NOW), 9)
+                self.assertEqual(seen, [])
+                raise AbortScope('cancel outer unit of work')
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.assert_promoted(selected, 9)
+        self.assertEqual(seen, [t.id for t in selected])
+
+    def test_failed_nested_transfer_can_retry_without_losing_parent_writes(self):
+        signal.alarm(10)
+        selected = add_batch(self.h, self.task, 17)
+        before = snapshot(self.path)
+        seen = self.events()
+        target = before['schedule'][8][0]
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('''CREATE TRIGGER nested_delete_fault BEFORE DELETE ON schedule
+                WHEN OLD.id=%d BEGIN SELECT RAISE(ABORT, 'nested delete failed'); END''' % target)
+        with self.h.storage.db(commit=True) as cursor:
+            self.h.storage.put_data('outer-survives', b'yes')
+            with self.assertRaises(Exception):
+                self.h.promote_schedule(NOW)
+            self.assertEqual(self.h.storage.queue_size(), 0)
+            self.assertEqual(self.h.storage.schedule_size(), 17)
+            self.assertEqual(self.h.storage.peek_data('outer-survives'), b'yes')
+            self.assertEqual(seen, [])
+            self.assertEqual(snapshot(self.path), before)
+            cursor.execute('DROP TRIGGER nested_delete_fault')
+            self.assertEqual(self.h.promote_schedule(NOW), 17)
+        self.assertEqual(seen, [t.id for t in selected])
+        self.assertEqual(self.h.storage.peek_data('outer-survives'), b'yes')
+
+    def test_nested_completion_failure_recovers_without_committing_parent(self):
+        signal.alarm(10)
+        selected = add_batch(self.h, self.task, 6)
+        seen = self.events()
+        denied = []
+
+        def authorizer(action, first, second, db, source):
+            if action == sqlite3.SQLITE_SAVEPOINT and first == 'RELEASE' and not denied:
+                denied.append(second)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        with self.h.storage.db(commit=True):
+            self.h.storage.put_data('parent-marker', b'safe')
+            error = None
+            with configure_connections(self.h, lambda c: c.set_authorizer(authorizer)):
+                try:
+                    count = self.h.promote_schedule(NOW)
+                except Exception as exc:
+                    error = exc
+            if denied:
+                self.assertIsNotNone(error)
+                self.assertEqual(self.h.storage.schedule_size(), 6)
+                self.assertEqual(self.h.storage.queue_size(), 0)
+            else:
+                # A compliant design need not expose this particular SQL
+                # fault point; its nesting semantics are checked separately.
+                self.assertIsNone(error)
+                self.assertEqual(count, 6)
+            self.assertEqual(self.h.storage.peek_data('parent-marker'), b'safe')
+            self.assertEqual(seen, [])
+            self.assertEqual(self.h.promote_schedule(NOW), 6 if denied else 0)
+        self.assertEqual(seen, [t.id for t in selected])
+
+    def test_outer_commit_failure_discards_all_deferred_notifications(self):
+        signal.alarm(10)
+        selected = add_batch(self.h, self.task, 8)
+        before = snapshot(self.path)
+        seen = self.events()
+        denied = []
+
+        def authorizer(action, first, second, db, source):
+            if action == sqlite3.SQLITE_TRANSACTION and first == 'COMMIT':
+                denied.append(first)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        with configure_connections(self.h, lambda c: c.set_authorizer(authorizer)):
+            with self.assertRaises(Exception):
+                with self.h.storage.db(commit=True):
+                    self.h.storage.put_data('uncommitted-marker', b'no')
+                    self.assertEqual(self.h.promote_schedule(NOW), 8)
+                    self.assertEqual(seen, [])
+        self.assertTrue(denied)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.assert_promoted(selected, 8)
+        self.assertEqual(seen, [t.id for t in selected])
+
+    def test_nested_close_is_deferred_and_signal_dispatch_releases_all_locks(self):
+        signal.alarm(10)
+        add_batch(self.h, self.task, 4)
+        observations, workers = [], []
+
+        @self.h.signal(SIGNAL_ENQUEUED)
+        def cross_thread_receiver(signal_name, task):
+            values = []
+            thread = threading.Thread(target=lambda: values.append(self.h.storage.queue_size()), daemon=True)
+            workers.append(thread)
+            thread.start()
+            thread.join(0.5)
+            observations.append((thread.is_alive(), list(values)))
+
+        with self.h.storage.db(commit=True) as outer:
+            connection = outer.connection
+            with self.h.storage.db(commit=True, close=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 4)
+                with self.h.storage.db(commit=False, close=True) as reader:
+                    reader.execute('SELECT count(*) FROM task WHERE queue=?', ('main',))
+                    self.assertEqual(reader.fetchone()[0], 4)
+            outer.execute('SELECT count(*) FROM task WHERE queue=?', ('main',))
+            self.assertEqual(outer.fetchone()[0], 4)
+            self.assertEqual(observations, [])
+        for thread in workers:
+            thread.join(1)
+        self.assertEqual(observations, [(False, [4])] * 4)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute('SELECT 1')
+        self.assertEqual(self.h.storage.queue_size(), 4)
+
+    def test_shared_instance_threads_have_separate_transaction_lifetimes(self):
+        signal.alarm(10)
+        selected = add_batch(self.h, self.task, 12)
+        seen = self.events()
+        entered, release, competing = threading.Event(), threading.Event(), threading.Event()
+        second_entered = threading.Event()
+        outcomes = []
+
+        def rollback_thread():
+            try:
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(self.h.promote_schedule(NOW), 12)
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError('coordination timed out')
+                    raise AbortScope('first owner cancelled')
+            except AbortScope:
+                outcomes.append(('rollback', True))
+            except BaseException as exc:
+                outcomes.append(('error', repr(exc)))
+                entered.set()
+
+        def commit_thread():
+            competing.set()
+            try:
+                with self.h.storage.db(commit=True):
+                    second_entered.set()
+                    count = self.h.promote_schedule(NOW)
+                outcomes.append(('commit', count))
+            except BaseException as exc:
+                outcomes.append(('error', repr(exc)))
+
+        first = threading.Thread(target=rollback_thread, daemon=True)
+        second = threading.Thread(target=commit_thread, daemon=True)
+        first.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            second.start()
+            self.assertTrue(competing.wait(1))
+            self.assertFalse(second_entered.wait(0.15), 'second thread joined an active transaction')
+        finally:
+            release.set()
+            first.join(3)
+            if second.ident is not None:
+                second.join(3)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertCountEqual(outcomes, [('rollback', True), ('commit', 12)])
+        self.assertEqual(seen, [t.id for t in selected])
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected])
+
+    def test_file_backend_fallback_preserves_existing_behavior(self):
+        file_huey = FileHuey('file-fallback', path=str(Path(self.temp.name) / 'file queue'))
+        task = register(file_huey)
+        file_huey.enqueue(task.s('existing', id='file-existing'))
+        file_huey.add_schedule(task.s('due', id='file-due', eta=NOW))
+        file_huey.add_schedule(task.s('future', id='file-future', eta=NOW + dt.timedelta(seconds=1)))
+        result = file_huey.promote_schedule(NOW)
+        self.assertIs(type(result), int)
+        self.assertEqual(result, 1)
+        self.assertEqual(file_huey.dequeue().id, 'file-existing')
+        self.assertEqual(file_huey.dequeue().id, 'file-due')
+        self.assertIsNone(file_huey.dequeue())
+        self.assertEqual(file_huey.promote_schedule(NOW), 0)
+        self.assertEqual([t.id for t in file_huey.read_schedule(NOW + dt.timedelta(seconds=1))], ['file-future'])
 
 
 if __name__ == '__main__':
