@@ -477,6 +477,61 @@ class PromotionTests(unittest.TestCase):
         ready = [self.h.deserialize_task(data) for data, in rows(self.path, 'task')]
         self.assertEqual(sum(type(t).__name__ == periodic.task_class.__name__ for t in ready), 1)
 
+    def test_scheduler_preserves_cadence_after_failed_promotion(self):
+        selected = add_batch(self.h, self.task, 4)
+        clock = [1000.0]
+        starts, waits = [], []
+        timer = mock.Mock()
+        timer.monotonic.side_effect = lambda: clock[0]
+        stop = mock.Mock()
+
+        def wait(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+
+        stop.wait.side_effect = wait
+        original = self.h.promote_schedule
+
+        def promotion(timestamp):
+            starts.append(clock[0])
+            clock[0] += 1.25
+            if len(starts) == 1:
+                raise RuntimeError('temporary promotion failure')
+            return original(timestamp)
+
+        with mock.patch('huey.consumer.time', timer):
+            scheduler = Scheduler(self.h, stop, 5, False)
+            with mock.patch.object(self.h, 'promote_schedule', promotion):
+                with self.assertLogs('huey.consumer', level='ERROR'):
+                    scheduler.loop(now=NOW)
+                scheduler.loop(now=NOW + dt.timedelta(seconds=5))
+                scheduler.loop(now=NOW + dt.timedelta(seconds=10))
+        self.assertEqual(starts, [1000.0, 1005.0, 1010.0])
+        self.assertEqual(waits, [3.75, 3.75, 3.75])
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected])
+        self.assertEqual(rows(self.path, 'schedule'), [])
+
+    def test_scheduler_periodic_cadence_does_not_burst_after_stall(self):
+        self.h.periodic_task(lambda timestamp: True, name='timed-periodic')(echo)
+        clock = [1000.0]
+        timer = mock.Mock()
+        timer.monotonic.side_effect = lambda: clock[0]
+        stop = mock.Mock()
+        stop.wait.side_effect = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+
+        with mock.patch('huey.consumer.time', timer):
+            scheduler = Scheduler(self.h, stop, 5, True)
+            for _ in range(12):
+                scheduler.loop(now=NOW + dt.timedelta(seconds=clock[0] - 1000))
+            self.assertEqual(len(rows(self.path, 'task')), 1)
+            scheduler.loop(now=NOW + dt.timedelta(seconds=60))
+            self.assertEqual(len(rows(self.path, 'task')), 2)
+            clock[0] += 300
+            for _ in range(3):
+                scheduler.loop(now=NOW + dt.timedelta(seconds=clock[0] - 1000))
+            self.assertEqual(len(rows(self.path, 'task')), 3)
+
+
     def test_legacy_destructive_read_and_memory_backend(self):
         selected = add_batch(self.h, self.task, 6)
         self.h.add_schedule(self.task.s('future', id='future', eta=NOW + dt.timedelta(seconds=1)))
