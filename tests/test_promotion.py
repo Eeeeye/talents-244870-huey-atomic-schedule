@@ -170,6 +170,93 @@ class FramedSerializer(Serializer):
         return super().deserialize(data[len(b'framed-v1\0'):])
 
 
+class ForkCheckedConnection(sqlite3.Connection):
+    inherited_closes = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.creator_pid = os.getpid()
+
+    def close(self):
+        if self.creator_pid != os.getpid():
+            self.inherited_closes.append((self.creator_pid, os.getpid()))
+            raise RuntimeError('native close on a parent-owned SQLite connection')
+        return super().close()
+
+
+def fork_promote_worker(hueys, gate, output, close_first=False, extra=None):
+    signal.alarm(9)
+    try:
+        if not gate.wait(4):
+            raise RuntimeError('parent did not release the database')
+        seen = []
+        for h in hueys:
+            h.signal(SIGNAL_ENQUEUED)(
+                lambda signal_name, item, name=h.name: seen.append((name, item.id)))
+            if close_first:
+                h.storage.close()
+        if extra is not None:
+            h = hueys[0]
+            task, task_id = extra
+            h.add_schedule(task.s('child payload', id=task_id, eta=NOW))
+        session_tables = []
+        for h in hueys:
+            with h.storage.db(commit=False) as cursor:
+                cursor.execute("SELECT name FROM sqlite_temp_master WHERE type='table'")
+                session_tables.append([row[0] for row in cursor.fetchall()])
+        with hueys[0].storage.db(commit=True):
+            counts = [h.promote_schedule(NOW) for h in hueys]
+        output.send({'counts': counts, 'seen': seen,
+                     'ready': [h.storage.queue_size() for h in hueys],
+                     'scheduled': [h.storage.schedule_size() for h in hueys],
+                     'session_tables': session_tables,
+                     'inherited_closes': list(ForkCheckedConnection.inherited_closes)})
+        for h in hueys:
+            h.storage.close()
+    except BaseException as exc:
+        output.send({'error': type(exc).__name__ + ': ' + str(exc)})
+    finally:
+        output.close()
+
+
+def fork_generation_worker(h, task, gate, output):
+    signal.alarm(12)
+    child = None
+    try:
+        if not gate.wait(3):
+            raise RuntimeError('first generation was not released')
+        seen = []
+        h.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: seen.append(item.id))
+        ctx = mp.get_context('fork')
+        child_gate = ctx.Event()
+        reader, writer = ctx.Pipe(duplex=False)
+        with h.storage.db(commit=False):
+            committed = h.promote_schedule(NOW)
+            child = ctx.Process(target=fork_promote_worker,
+                                args=([h], child_gate, writer, True,
+                                      (task, 'grandchild-job')))
+            child.start()
+        child_gate.set()
+        if not reader.poll(6):
+            raise RuntimeError('descendant did not finish')
+        result = reader.recv()
+        child.join(2)
+        if child.is_alive() or child.exitcode != 0:
+            raise RuntimeError('descendant exited abnormally')
+        output.send({'committed': committed, 'own_signals': seen,
+                     'descendant': result})
+        reader.close()
+        writer.close()
+        h.storage.close()
+    except BaseException as exc:
+        output.send({'error': type(exc).__name__ + ': ' + str(exc)})
+    finally:
+        if child is not None and child.is_alive():
+            child.kill()
+            child.join(2)
+        output.close()
+
+
 class PromotionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='promotion-case-')
@@ -1083,6 +1170,269 @@ class PromotionTests(unittest.TestCase):
         self.assertCountEqual(outcomes, [('rollback', True), ('commit', 7)])
         self.assertEqual(seen, [('main', t.id) for t in selected])
 
+
+
+    def install_abort_trigger(self, action='ROLLBACK'):
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute("CREATE TRIGGER transaction_fault BEFORE INSERT ON kv "
+                         "WHEN NEW.key='abort-key' BEGIN SELECT RAISE(%s, 'injected transaction fault'); END" % action)
+
+    def remove_abort_trigger(self):
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER transaction_fault')
+
+    def test_automatic_rollback_invalidates_all_enclosing_alias_scopes(self):
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 2)
+        second = add_batch(peer, task, 3, prefix='peer')
+        before = snapshot(self.path)
+        seen = self.watch_queues(self.h, peer)
+        other_path = Path(self.temp.name) / 'independent-abort.sqlite'
+        new_database(other_path)
+        other, other_task = self.peer(name='main', path=other_path)
+        independent = add_batch(other, other_task, 1, prefix='independent')
+        self.install_abort_trigger()
+        reached = []
+        with self.assertRaises(Exception):
+            with self.h.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 2)
+                self.h.storage.incr('parent-count', 7)
+                with peer.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 3)
+                    with self.assertRaises(Exception):
+                        with self.h.storage.db(commit=True):
+                            peer.storage.put_data('abort-key', b'trigger')
+                    reached.append('aborted')
+                    for operation in (self.h.storage.queue_size,
+                                      lambda: peer.storage.peek_data('missing'),
+                                      lambda: self.h.storage.incr('late-counter', 1),
+                                      lambda: peer.storage.put_data('late-write', b'no'),
+                                      lambda: self.h.promote_schedule(NOW)):
+                        with self.assertRaises(Exception):
+                            operation()
+                    self.assertEqual(other.promote_schedule(NOW), 1)
+        self.assertEqual(reached, ['aborted'])
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.assertEqual(task_ids(other, other_path), [independent[0].id])
+        self.remove_abort_trigger()
+        with peer.storage.db(commit=True):
+            self.assertEqual(self.h.promote_schedule(NOW), 2)
+            self.assertEqual(peer.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [('main', t.id) for t in first] +
+                         [('peer', t.id) for t in second])
+
+    def test_caught_raw_cursor_rollback_still_rejects_outer_commit(self):
+        selected = add_batch(self.h, self.task, 3)
+        before = snapshot(self.path)
+        seen = self.events()
+        self.install_abort_trigger()
+        reached = []
+        with self.assertRaises(Exception):
+            with self.h.storage.db(commit=True) as cursor:
+                self.assertEqual(self.h.promote_schedule(NOW), 3)
+                self.h.storage.put_data('discard', b'no')
+                with self.assertRaises(sqlite3.IntegrityError):
+                    cursor.execute('INSERT INTO kv VALUES (?, ?, ?)',
+                                   ('main', 'abort-key', b'fault'))
+                reached.append('caught raw SQLite abort')
+                # No subsequent storage call is needed to notice the abort.
+        self.assertEqual(reached, ['caught raw SQLite abort'])
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.remove_abort_trigger()
+        self.assertEqual(self.h.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [t.id for t in selected])
+
+    def test_aborted_write_recovers_inside_read_scope_without_losing_prior_signals(self):
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 1, prefix='committed')
+        second = add_batch(peer, task, 2, prefix='peer')
+        seen = self.watch_queues(self.h, peer)
+        self.install_abort_trigger()
+        with self.h.storage.db(commit=False, close=True) as reader:
+            connection = reader.connection
+            self.assertEqual(self.h.promote_schedule(NOW), 1)
+            later = add_batch(self.h, self.task, 2, prefix='later')
+            with self.assertRaises(Exception):
+                with peer.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 2)
+                    self.assertEqual(self.h.promote_schedule(NOW), 2)
+                    with self.assertRaises(Exception):
+                        self.h.storage.put_data('abort-key', b'fault')
+            self.assertEqual(self.h.storage.queue_size(), 1)
+            self.assertEqual(peer.storage.queue_size(), 0)
+            self.assertEqual(self.h.storage.schedule_size(), 2)
+            self.assertEqual(peer.storage.schedule_size(), 2)
+            with peer.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 2)
+                self.assertEqual(peer.promote_schedule(NOW), 2)
+            expected = [('main', t.id) for t in first + later] + [('peer', t.id) for t in second]
+            self.assertEqual(seen, expected[:len(seen)])
+            reader.execute('SELECT count(*) FROM task')
+            self.assertEqual(reader.fetchone()[0], 5)
+        self.assertEqual(seen, [('main', t.id) for t in first + later] +
+                         [('peer', t.id) for t in second])
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute('SELECT 1')
+        self.assertEqual(self.h.storage.queue_size(), 3)
+        self.assertEqual(peer.storage.queue_size(), 2)
+
+    def test_statement_abort_does_not_poison_a_surviving_parent_transaction(self):
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 2)
+        second = add_batch(peer, task, 3, prefix='peer')
+        seen = self.watch_queues(self.h, peer)
+        self.install_abort_trigger('ABORT')
+        with self.h.storage.db(commit=True) as outer:
+            self.assertEqual(self.h.promote_schedule(NOW), 2)
+            self.h.storage.incr('survive', 9)
+            with self.assertRaises(Exception):
+                with peer.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 3)
+                    peer.storage.put_data('abort-key', b'fault')
+            self.assertEqual(self.h.storage.queue_size(), 2)
+            self.assertEqual(peer.storage.schedule_size(), 3)
+            self.assertEqual(self.h.storage.incr('survive', 0), 9)
+            outer.execute('DROP TRIGGER transaction_fault')
+            self.assertEqual(peer.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [('main', t.id) for t in first] +
+                         [('peer', t.id) for t in second])
+
+    def start_fork(self, hueys, close_first=False, extra=None, target=fork_promote_worker):
+        ctx = mp.get_context('fork')
+        gate = ctx.Event()
+        reader, writer = ctx.Pipe(duplex=False)
+        args = (hueys[0], self.task, gate, writer) if target is fork_generation_worker else (
+            hueys, gate, writer, close_first,
+            (self.task, extra) if extra is not None else None)
+        child = ctx.Process(target=target, args=args)
+        self.children.append(child)
+        child.start()
+        writer.close()
+        return child, gate, reader
+
+    def finish_fork(self, handle):
+        child, gate, reader = handle
+        gate.set()
+        self.assertTrue(reader.poll(8), 'forked worker must finish after parent releases its scope')
+        result = reader.recv()
+        reader.close()
+        child.join(2)
+        self.assertFalse(child.is_alive(), 'forked worker did not exit')
+        self.assertEqual(child.exitcode, 0)
+        self.assertNotIn('error', result)
+        return result
+
+    def test_forked_aliases_do_not_inherit_parent_read_scope_or_notifications(self):
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 2)
+        second = add_batch(peer, task, 3, prefix='peer')
+        seen = self.watch_queues(self.h, peer)
+        with self.h.storage.db(commit=False) as cursor:
+            cursor.execute('CREATE TEMP TABLE parent_private_state (value TEXT)')
+            cursor.execute("INSERT INTO parent_private_state VALUES ('parent')")
+        with self.h.storage.db(commit=False):
+            with self.h.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 2)
+                self.assertEqual(peer.promote_schedule(NOW), 3)
+            later = add_batch(peer, task, 2, prefix='child-peer')
+            handle = self.start_fork([self.h, peer], extra='child-main')
+            parent_events = [('main', t.id) for t in first] + [('peer', t.id) for t in second]
+            self.assertEqual(seen, parent_events[:len(seen)])
+        parent_events = [('main', t.id) for t in first] + [('peer', t.id) for t in second]
+        self.assertEqual(seen, parent_events)
+        result = self.finish_fork(handle)
+        self.assertEqual(result['counts'], [1, 2])
+        self.assertEqual(result['scheduled'], [0, 0])
+        self.assertEqual(result['ready'], [3, 5])
+        for session_tables in result['session_tables']:
+            self.assertNotIn('parent_private_state', session_tables)
+        self.assertEqual(result['seen'], [('main', 'child-main')] +
+                         [('peer', t.id) for t in later])
+        self.assertEqual(seen, parent_events)
+        self.assertEqual(self.h.storage.queue_size(), 3)
+        self.assertEqual(peer.storage.queue_size(), 5)
+        with self.h.storage.db(commit=False) as cursor:
+            cursor.execute('SELECT value FROM parent_private_state')
+            self.assertEqual(cursor.fetchall(), [('parent',)])
+
+    def test_fork_while_another_thread_owns_scope_and_child_close_is_safe(self):
+        self.h, self.task = self.peer(name='main', factory=ForkCheckedConnection)
+        ForkCheckedConnection.inherited_closes = []
+        selected = add_batch(self.h, self.task, 3)
+        seen = self.events()
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+
+        def owner():
+            try:
+                with self.h.storage.db(commit=False):
+                    self.assertEqual(self.h.promote_schedule(NOW), 3)
+                    entered.set()
+                    if not release.wait(4):
+                        raise RuntimeError('parent not released')
+            except BaseException as exc:
+                errors.append(repr(exc))
+                entered.set()
+
+        thread = threading.Thread(target=owner, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertEqual(errors, [])
+            handle = self.start_fork([self.h], close_first=True, extra='child-after-commit')
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        result = self.finish_fork(handle)
+        self.assertEqual(result['counts'], [1])
+        self.assertEqual(result['seen'], [('main', 'child-after-commit')])
+        self.assertEqual(result['ready'], [4])
+        self.assertEqual(result['inherited_closes'], [])
+        self.assertEqual(seen, [t.id for t in selected])
+        self.assertEqual(self.h.storage.queue_size(), 4)
+        self.h.storage.put_data('parent-still-works', b'yes')
+        self.assertEqual(self.h.storage.peek_data('parent-still-works'), b'yes')
+
+    def test_fork_during_notification_dispatch_gets_an_independent_dispatch_queue(self):
+        first = add_batch(self.h, self.task, 2)
+        parent_pid = os.getpid()
+        handles, seen = [], []
+
+        def on_enqueue(signal_name, item):
+            seen.append(item.id)
+            if os.getpid() == parent_pid and item.id == first[0].id:
+                handles.append(self.start_fork([self.h], extra='child-during-dispatch'))
+
+        self.h.signal(SIGNAL_ENQUEUED)(on_enqueue)
+        self.assertEqual(self.h.promote_schedule(NOW), 2)
+        self.assertEqual(len(handles), 1)
+        self.assertEqual(seen, [t.id for t in first])
+        result = self.finish_fork(handles[0])
+        self.assertEqual(result['counts'], [1])
+        self.assertEqual(result['seen'], [('main', 'child-during-dispatch')])
+        self.assertEqual(result['ready'], [3])
+        self.assertEqual(seen, [t.id for t in first])
+        self.assertEqual(self.h.storage.queue_size(), 3)
+
+    def test_descendant_fork_resets_process_state_again(self):
+        selected = add_batch(self.h, self.task, 2)
+        seen = self.events()
+        handle = self.start_fork([self.h], target=fork_generation_worker)
+        result = self.finish_fork(handle)
+        self.assertEqual(result['committed'], 2)
+        self.assertEqual(result['own_signals'], [t.id for t in selected])
+        child = result['descendant']
+        self.assertNotIn('error', child)
+        self.assertEqual(child['counts'], [1])
+        self.assertEqual(child['ready'], [3])
+        self.assertEqual(child['scheduled'], [0])
+        self.assertEqual(child['seen'], [('main', 'grandchild-job')])
+        self.assertEqual(seen, [])
+        self.assertEqual(self.h.storage.queue_size(), 3)
 
 
 if __name__ == '__main__':

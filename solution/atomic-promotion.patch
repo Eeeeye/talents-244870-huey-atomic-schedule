@@ -73,17 +73,19 @@
              finally:
                  cursor.close()
                  if close:
-@@ -881,8 +882,57 @@
+@@ -881,8 +882,72 @@
                  return curs.fetchall()
  
  
 +class _SqliteContext:
 +    def __init__(self):
++        self.pid = os.getpid()
 +        self.lock = threading.RLock()
 +        self.depth = 0
 +        self.connection = None
 +        self.owner = None
 +        self.write_scopes = []
++        self.aborted = False
 +        self.sequence = 0
 +        self.close_requests = set()
 +        self.committed_callbacks = []
@@ -111,6 +113,19 @@
 +
 +_sqlite_contexts = weakref.WeakValueDictionary()
 +_sqlite_contexts_lock = threading.Lock()
++_sqlite_inherited = []
++
++
++def _sqlite_after_fork():
++    global _sqlite_contexts, _sqlite_contexts_lock
++    # Never run SQLite cleanup on a connection inherited from the parent.
++    _sqlite_inherited.extend(list(_sqlite_contexts.values()))
++    _sqlite_contexts = weakref.WeakValueDictionary()
++    _sqlite_contexts_lock = threading.Lock()
++
++
++if hasattr(os, 'register_at_fork'):
++    os.register_at_fork(after_in_child=_sqlite_after_fork)
 +
 +
 +def _sqlite_context(filename, uri=False):
@@ -131,7 +146,7 @@
      integrity_error = getattr(sqlite3, 'IntegrityError', None)
      sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
      table_kv = ('create table if not exists kv ('
-@@ -915,6 +965,7 @@
+@@ -915,6 +980,7 @@
          self._journal_mode = journal_mode
          self._timeout = timeout  # Busy timeout in seconds, default is 5.
          self._conn_kwargs = kwargs
@@ -139,15 +154,25 @@
  
          # By default Sqlite may reuse rowids when rows are removed. This means
          # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
-@@ -932,6 +983,101 @@
+@@ -932,6 +998,125 @@
          self.to_blob = memoryview
  
          super(SqliteStorage, self).__init__(name, create_tables=create_tables)
 +        self.lock = self._context.lock
 +
++    def _process_context(self):
++        if self._context.pid != os.getpid():
++            if self._conn is not None:
++                _sqlite_inherited.append(self._conn)
++                self._conn = None
++            self._context = _sqlite_context(
++                self.filename, self._conn_kwargs.get('uri', False))
++            self.lock = self._context.lock
++        return self._context
++
 +    @property
 +    def conn(self):
-+        context = self._context
++        context = self._process_context()
 +        with context.lock:
 +            if context.depth:
 +                return context.connection
@@ -156,7 +181,7 @@
 +            return self._conn
 +
 +    def close(self):
-+        with self._context.lock:
++        with self._process_context().lock:
 +            if self._conn is None:
 +                return False
 +            self._conn.close()
@@ -167,7 +192,7 @@
 +    def db(self, commit=False, close=False):
 +        # The file coordinator serializes threads and lets aliases on the
 +        # owning thread reuse the current connection and savepoint stack.
-+        context = self._context
++        context = self._process_context()
 +        callbacks = []
 +        try:
 +            with context.lock:
@@ -182,6 +207,11 @@
 +                frame = None
 +                savepoint = None
 +                try:
++                    if context.write_scopes and (
++                            context.aborted or not conn.in_transaction):
++                        context.aborted = True
++                        raise sqlite3.OperationalError(
++                            'The enclosing SQLite transaction was aborted')
 +                    if commit:
 +                        if context.write_scopes:
 +                            context.sequence += 1
@@ -193,16 +223,23 @@
 +                        context.write_scopes.append(frame)
 +                    try:
 +                        yield cursor
++                        if context.write_scopes and (
++                                context.aborted or not conn.in_transaction):
++                            context.aborted = True
++                            raise sqlite3.OperationalError(
++                                'The enclosing SQLite transaction was aborted')
 +                        if frame is not None:
 +                            if savepoint is None:
 +                                conn.commit()
 +                            else:
 +                                cursor.execute('RELEASE SAVEPOINT ' + savepoint)
 +                    except BaseException:
-+                        if frame is not None:
++                        if context.write_scopes and not conn.in_transaction:
++                            context.aborted = True
++                        if frame is not None and conn.in_transaction:
 +                            if savepoint is None:
 +                                conn.rollback()
-+                            else:
++                            elif not context.aborted:
 +                                cursor.execute('ROLLBACK TO SAVEPOINT ' + savepoint)
 +                                cursor.execute('RELEASE SAVEPOINT ' + savepoint)
 +                        raise
@@ -215,6 +252,8 @@
 +                    finally:
 +                        if frame is not None:
 +                            context.write_scopes.pop()
++                            if not context.write_scopes:
++                                context.aborted = False
 +                finally:
 +                    cursor.close()
 +                    context.depth -= 1
@@ -241,7 +280,7 @@
  
      def _create_connection(self):
          conn = sqlite3.connect(self.filename, timeout=self._timeout,
-@@ -1001,6 +1147,29 @@
+@@ -1001,6 +1186,29 @@
                  curs.execute('delete from schedule where id in (%s)' %
                               ','.join('?' * len(chunk)), chunk)
              return data
