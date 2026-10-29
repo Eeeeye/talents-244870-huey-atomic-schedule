@@ -478,38 +478,43 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(sum(type(t).__name__ == periodic.task_class.__name__ for t in ready), 1)
 
     def test_scheduler_preserves_cadence_after_failed_promotion(self):
-        selected = add_batch(self.h, self.task, 4)
-        clock = [1000.0]
-        starts, waits = [], []
-        timer = mock.Mock()
-        timer.monotonic.side_effect = lambda: clock[0]
-        stop = mock.Mock()
+        for interval, work in [(1, 0.125), (3, 0.5), (5, 1.25), (15, 2.5), (60, 5.0)]:
+            with self.subTest(interval=interval):
+                queue = 'cadence-%d' % interval
+                huey, task = make_huey(self.path, name=queue)
+                self.connections.append(huey)
+                selected = add_batch(huey, task, 4, prefix=queue)
+                clock = [1000.0]
+                starts, waits = [], []
+                timer = mock.Mock()
+                timer.monotonic.side_effect = lambda: clock[0]
+                stop = mock.Mock()
 
-        def wait(seconds):
-            waits.append(seconds)
-            clock[0] += seconds
+                def wait(seconds):
+                    waits.append(seconds)
+                    clock[0] += seconds
 
-        stop.wait.side_effect = wait
-        original = self.h.promote_schedule
+                stop.wait.side_effect = wait
+                original = huey.promote_schedule
 
-        def promotion(timestamp):
-            starts.append(clock[0])
-            clock[0] += 1.25
-            if len(starts) == 1:
-                raise RuntimeError('temporary promotion failure')
-            return original(timestamp)
+                def promotion(timestamp):
+                    starts.append(clock[0])
+                    clock[0] += work
+                    if len(starts) == 1:
+                        raise RuntimeError('temporary promotion failure')
+                    return original(timestamp)
 
-        with mock.patch('huey.consumer.time', timer):
-            scheduler = Scheduler(self.h, stop, 5, False)
-            with mock.patch.object(self.h, 'promote_schedule', promotion):
-                with self.assertLogs('huey.consumer', level='ERROR'):
-                    scheduler.loop(now=NOW)
-                scheduler.loop(now=NOW + dt.timedelta(seconds=5))
-                scheduler.loop(now=NOW + dt.timedelta(seconds=10))
-        self.assertEqual(starts, [1000.0, 1005.0, 1010.0])
-        self.assertEqual(waits, [3.75, 3.75, 3.75])
-        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected])
-        self.assertEqual(rows(self.path, 'schedule'), [])
+                with mock.patch('huey.consumer.time', timer):
+                    scheduler = Scheduler(huey, stop, interval, False)
+                    with mock.patch.object(huey, 'promote_schedule', promotion):
+                        with self.assertLogs('huey.consumer', level='ERROR'):
+                            scheduler.loop(now=NOW)
+                        scheduler.loop(now=NOW + dt.timedelta(seconds=interval))
+                        scheduler.loop(now=NOW + dt.timedelta(seconds=2 * interval))
+                self.assertEqual(starts, [1000.0, 1000.0 + interval, 1000.0 + 2 * interval])
+                self.assertEqual(waits, [interval - work] * 3)
+                self.assertCountEqual(task_ids(huey, self.path, queue=queue), [t.id for t in selected])
+                self.assertEqual(rows(self.path, 'schedule', queue=queue), [])
 
     def test_scheduler_periodic_cadence_does_not_burst_after_stall(self):
         self.h.periodic_task(lambda timestamp: True, name='timed-periodic')(echo)
