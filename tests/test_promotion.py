@@ -758,6 +758,272 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(file_huey.promote_schedule(NOW), 0)
         self.assertEqual([t.id for t in file_huey.read_schedule(NOW + dt.timedelta(seconds=1))], ['file-future'])
 
+    def peer(self, name='peer', path=None, **kwargs):
+        h, task = make_huey(self.path if path is None else path, name=name, **kwargs)
+        self.connections.append(h)
+        return h, task
+
+    def watch_queues(self, *queues):
+        seen = []
+        for h in queues:
+            h.signal(SIGNAL_ENQUEUED)(
+                lambda signal_name, task, queue=h.name: seen.append((queue, task.id)))
+        return seen
+
+    def test_same_file_queues_join_one_transaction_and_keep_payloads(self):
+        signal.alarm(10)
+        peer, peer_task = self.peer(serializer=FramedSerializer())
+        first = add_batch(self.h, self.task, 3, prefix='main')
+        second = add_batch(peer, peer_task, 4, prefix='peer')
+        before = snapshot(self.path)
+        seen = self.watch_queues(self.h, peer)
+        with self.h.storage.db(commit=True) as outer:
+            self.h.storage.put_data('main-marker', b'one')
+            self.assertEqual(self.h.promote_schedule(NOW), 3)
+            with peer.storage.db(commit=True):
+                peer.storage.put_data('peer-marker', b'two')
+                self.assertEqual(peer.promote_schedule(NOW), 4)
+                self.h.storage.incr('main-count', 17)
+            with peer.storage.db(commit=False) as reader:
+                reader.execute('SELECT count(*) FROM task')
+                self.assertEqual(reader.fetchone()[0], 7)
+            self.assertEqual(peer.storage.queue_size(), 4)
+            self.assertEqual(peer.promote_schedule(NOW), 0)
+            self.assertEqual(snapshot(self.path), before)
+            self.assertEqual(seen, [])
+            outer.execute('SELECT count(*) FROM schedule')
+            self.assertEqual(outer.fetchone()[0], 0)
+        self.assertEqual(seen, [('main', t.id) for t in first] + [('peer', t.id) for t in second])
+        self.assertEqual(peer.storage.peek_data('peer-marker'), b'two')
+        self.assertEqual(self.h.storage.peek_data('main-marker'), b'one')
+        self.assertEqual(self.h.storage.incr('main-count', 0), 17)
+        expected = {t.id: (t.args, t.kwargs) for t in second}
+        for _ in second:
+            item = peer.dequeue()
+            self.assertEqual((item.args, item.kwargs), expected.pop(item.id))
+        self.assertEqual(expected, {})
+
+    def test_alias_inner_rollback_restores_both_queues_but_keeps_parent(self):
+        signal.alarm(10)
+        peer, peer_task = self.peer()
+        first = add_batch(self.h, self.task, 2, prefix='survive')
+        other = add_batch(peer, peer_task, 5, prefix='peer')
+        seen = self.watch_queues(self.h, peer)
+        with self.h.storage.db(commit=True):
+            self.assertEqual(self.h.promote_schedule(NOW), 2)
+            later = add_batch(self.h, self.task, 3, prefix='retry')
+            self.h.storage.incr('count', 9)
+            with self.assertRaises(AbortScope):
+                with peer.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 5)
+                    self.assertEqual(self.h.promote_schedule(NOW), 3)
+                    self.h.storage.incr('count', 100)
+                    peer.storage.put_data('discard', b'no')
+                    raise AbortScope('cancel both queues in the child scope')
+            self.assertEqual(self.h.storage.queue_size(), 2)
+            self.assertEqual(self.h.storage.schedule_size(), 3)
+            self.assertEqual(peer.storage.queue_size(), 0)
+            self.assertEqual(peer.storage.schedule_size(), 5)
+            self.assertEqual(self.h.storage.incr('count', 0), 9)
+            self.assertEqual(seen, [])
+            self.assertEqual(peer.promote_schedule(NOW), 5)
+            self.assertEqual(self.h.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [('main', t.id) for t in first] +
+                         [('peer', t.id) for t in other] + [('main', t.id) for t in later])
+        self.assertFalse(any(r[1] == 'discard' for r in snapshot(self.path)['kv']))
+
+    def test_alias_outer_abort_discards_every_participant(self):
+        signal.alarm(10)
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 3)
+        second = add_batch(peer, task, 4, prefix='peer')
+        before = snapshot(self.path)
+        seen = self.watch_queues(self.h, peer)
+        with self.assertRaises(AbortScope):
+            with peer.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 3)
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 4)
+                    peer.storage.incr('discard', 8)
+                raise AbortScope('cancel outer owner')
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.assertEqual(self.h.promote_schedule(NOW), 3)
+        self.assertEqual(peer.promote_schedule(NOW), 4)
+        self.assertEqual(seen, [('main', t.id) for t in first] + [('peer', t.id) for t in second])
+
+    def test_instance_created_inside_transaction_defers_connection_close(self):
+        signal.alarm(10)
+        first = add_batch(self.h, self.task, 3)
+        seen = self.watch_queues(self.h)
+        with self.h.storage.db(commit=True) as outer:
+            connection = outer.connection
+            self.assertEqual(self.h.promote_schedule(NOW), 3)
+            peer, task = self.peer(name='created-inside')
+            peer.signal(SIGNAL_ENQUEUED)(lambda signal_name, t: seen.append((peer.name, t.id)))
+            selected = add_batch(peer, task, 2)
+            with peer.storage.db(commit=True, close=True):
+                self.assertEqual(peer.promote_schedule(NOW), 2)
+            outer.execute('SELECT count(*) FROM task')
+            self.assertEqual(outer.fetchone()[0], 5)
+            self.assertEqual(seen, [])
+            self.assertEqual(len(rows(self.path, 'task')), 0)
+        self.assertEqual(seen, [('main', t.id) for t in first] + [(peer.name, t.id) for t in selected])
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute('SELECT 1')
+        self.assertEqual(self.h.storage.queue_size(), 3)
+        self.assertEqual(peer.storage.queue_size(), 2)
+
+    def test_relative_and_symlink_paths_share_the_same_transaction(self):
+        signal.alarm(10)
+        relative, rel_task = self.peer(name='relative', path=os.path.relpath(self.path))
+        link = Path(self.temp.name) / 'alias.sqlite'
+        link.symlink_to(self.path)
+        alias, alias_task = self.peer(name='link', path=link)
+        first = add_batch(relative, rel_task, 2)
+        second = add_batch(alias, alias_task, 3)
+        before = snapshot(self.path)
+        seen = self.watch_queues(relative, alias)
+        with self.h.storage.db(commit=True):
+            self.assertEqual(relative.promote_schedule(NOW), 2)
+            with alias.storage.db(commit=True):
+                self.assertEqual(alias.promote_schedule(NOW), 3)
+            self.assertEqual(alias.storage.queue_size(), 3)
+            self.assertEqual(snapshot(self.path), before)
+            self.assertEqual(seen, [])
+        self.assertEqual(seen, [('relative', t.id) for t in first] + [('link', t.id) for t in second])
+
+    def test_distinct_database_transaction_is_not_captured_by_another_file(self):
+        signal.alarm(10)
+        other_path = Path(self.temp.name) / 'independent.sqlite'
+        new_database(other_path)
+        other, task = self.peer(name='main', path=other_path)
+        add_batch(self.h, self.task, 3)
+        independent = add_batch(other, task, 2, prefix='independent')
+        before = snapshot(self.path)
+        seen = self.watch_queues(self.h, other)
+        with self.assertRaises(AbortScope):
+            with self.h.storage.db(commit=True):
+                self.assertEqual(self.h.promote_schedule(NOW), 3)
+                self.assertEqual(other.promote_schedule(NOW), 2)
+                self.assertEqual(len(rows(other_path, 'task')), 2)
+                self.assertEqual(seen, [('main', t.id) for t in independent])
+                raise AbortScope('only the first database is cancelled')
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(other.storage.queue_size(), 2)
+
+    def test_alias_commit_failure_rolls_back_all_queues_then_recovers(self):
+        signal.alarm(10)
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 2)
+        second = add_batch(peer, task, 3)
+        before = snapshot(self.path)
+        seen = self.watch_queues(self.h, peer)
+        rejected = []
+
+        def authorizer(action, first, second, db, source):
+            if action == sqlite3.SQLITE_TRANSACTION and first == 'COMMIT':
+                rejected.append(first)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        with configure_connections(self.h, lambda c: c.set_authorizer(authorizer)):
+            with self.assertRaises(Exception):
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(peer.promote_schedule(NOW), 3)
+                    self.assertEqual(self.h.promote_schedule(NOW), 2)
+        self.assertTrue(rejected, 'must reach the final SQLite commit')
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        with peer.storage.db(commit=True):
+            self.assertEqual(self.h.promote_schedule(NOW), 2)
+            self.assertEqual(peer.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [('main', t.id) for t in first] + [('peer', t.id) for t in second])
+
+    def test_reentrant_promotion_queues_signals_after_all_already_committed_batches(self):
+        signal.alarm(10)
+        peer, task = self.peer()
+        first = add_batch(self.h, self.task, 2)
+        second = add_batch(peer, task, 2, prefix='peer')
+        seen, inside, workers, observations = [], [], [], []
+        later = []
+
+        def observe(queue, item):
+            seen.append((queue.name, item.id))
+            values = []
+            thread = threading.Thread(target=lambda: values.append(peer.storage.queue_size()), daemon=True)
+            workers.append(thread)
+            thread.start()
+            thread.join(0.5)
+            observations.append(not thread.is_alive() and len(values) == 1)
+            if item.id == first[0].id:
+                later.extend(add_batch(peer, task, 2, prefix='receiver'))
+                inside.append(peer.promote_schedule(NOW))
+                inside.append(list(seen))
+
+        self.h.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: observe(self.h, item))
+        peer.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: observe(peer, item))
+        with self.h.storage.db(commit=True):
+            self.assertEqual(self.h.promote_schedule(NOW), 2)
+            self.assertEqual(peer.promote_schedule(NOW), 2)
+        for thread in workers:
+            thread.join(1)
+        self.assertEqual(inside, [2, [('main', first[0].id)]])
+        self.assertEqual(seen, [('main', t.id) for t in first] +
+                         [('peer', t.id) for t in second + later])
+        self.assertEqual(observations, [True] * 6)
+
+    def test_aliases_in_competing_threads_do_not_share_a_write_scope(self):
+        signal.alarm(10)
+        alias, _ = self.peer(name='main')
+        selected = add_batch(self.h, self.task, 7)
+        seen = self.watch_queues(self.h, alias)
+        entered, release, attempting, second_entered = [threading.Event() for _ in range(4)]
+        outcomes = []
+
+        def first_owner():
+            try:
+                with self.h.storage.db(commit=True):
+                    self.assertEqual(self.h.promote_schedule(NOW), 7)
+                    entered.set()
+                    if not release.wait(3):
+                        raise RuntimeError('coordination timed out')
+                    raise AbortScope()
+            except AbortScope:
+                outcomes.append(('rollback', True))
+            except BaseException as exc:
+                outcomes.append(('error', repr(exc)))
+                entered.set()
+
+        def second_owner():
+            attempting.set()
+            try:
+                with alias.storage.db(commit=True):
+                    second_entered.set()
+                    count = alias.promote_schedule(NOW)
+                outcomes.append(('commit', count))
+            except BaseException as exc:
+                outcomes.append(('error', repr(exc)))
+
+        a = threading.Thread(target=first_owner, daemon=True)
+        b = threading.Thread(target=second_owner, daemon=True)
+        a.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            b.start()
+            self.assertTrue(attempting.wait(1))
+            self.assertFalse(second_entered.wait(0.15))
+        finally:
+            release.set()
+            a.join(3)
+            if b.ident is not None:
+                b.join(3)
+        self.assertFalse(a.is_alive())
+        self.assertFalse(b.is_alive())
+        self.assertCountEqual(outcomes, [('rollback', True), ('commit', 7)])
+        self.assertEqual(seen, [('main', t.id) for t in selected])
+
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

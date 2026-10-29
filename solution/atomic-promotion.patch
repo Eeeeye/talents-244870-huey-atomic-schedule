@@ -37,7 +37,15 @@
          for msg in messages:
 --- a/huey/storage.py
 +++ b/huey/storage.py
-@@ -824,11 +824,12 @@
+@@ -13,6 +13,7 @@
+ import struct
+ import threading
+ import time
++import weakref
+ 
+ try:
+     import cysqlite
+@@ -824,11 +825,12 @@
  class BaseSqlStorage(BaseStorage):
      begin_sql = 'begin'
      ddl = []
@@ -51,7 +59,7 @@
          self._conn = None
          if create_tables:
              self.initialize_schema()
-@@ -858,11 +859,10 @@
+@@ -858,11 +860,10 @@
              try:
                  if commit: cursor.execute(self.begin_sql)
                  yield cursor
@@ -65,54 +73,124 @@
              finally:
                  cursor.close()
                  if close:
-@@ -883,6 +883,7 @@
+@@ -881,8 +882,57 @@
+                 return curs.fetchall()
  
+ 
++class _SqliteContext:
++    def __init__(self):
++        self.lock = threading.RLock()
++        self.depth = 0
++        self.connection = None
++        self.owner = None
++        self.write_scopes = []
++        self.sequence = 0
++        self.close_requests = set()
++        self.committed_callbacks = []
++        self.dispatch = threading.local()
++
++    def notify(self, callbacks):
++        if not callbacks:
++            return
++        state = self.dispatch
++        if not hasattr(state, 'pending'):
++            state.pending = []
++            state.draining = False
++        state.pending.extend(callbacks)
++        if state.draining:
++            return
++        state.draining = True
++        try:
++            while state.pending:
++                callback = state.pending.pop(0)
++                callback()
++        finally:
++            state.draining = False
++            state.pending = []
++
++
++_sqlite_contexts = weakref.WeakValueDictionary()
++_sqlite_contexts_lock = threading.Lock()
++
++
++def _sqlite_context(filename, uri=False):
++    # Private/URI databases retain their independent connection semantics.
++    if uri or not filename or os.fspath(filename) == ':memory:':
++        return _SqliteContext()
++    key = (os.getpid(), os.path.realpath(os.path.abspath(filename)))
++    with _sqlite_contexts_lock:
++        context = _sqlite_contexts.get(key)
++        if context is None:
++            context = _sqlite_contexts[key] = _SqliteContext()
++        return context
++
++
  class SqliteStorage(BaseSqlStorage):
      begin_sql = 'begin exclusive'
 +    lock_class = threading.RLock
      integrity_error = getattr(sqlite3, 'IntegrityError', None)
      sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
      table_kv = ('create table if not exists kv ('
-@@ -915,6 +916,11 @@
+@@ -915,6 +965,7 @@
          self._journal_mode = journal_mode
          self._timeout = timeout  # Busy timeout in seconds, default is 5.
          self._conn_kwargs = kwargs
-+        self._db_depth = 0
-+        self._write_scopes = []
-+        self._savepoint_sequence = 0
-+        self._close_requested = False
-+        self._committed_callbacks = []
++        self._context = _sqlite_context(filename, kwargs.get('uri', False))
  
          # By default Sqlite may reuse rowids when rows are removed. This means
          # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
-@@ -932,6 +938,70 @@
+@@ -932,6 +983,101 @@
          self.to_blob = memoryview
  
          super(SqliteStorage, self).__init__(name, create_tables=create_tables)
++        self.lock = self._context.lock
++
++    @property
++    def conn(self):
++        context = self._context
++        with context.lock:
++            if context.depth:
++                return context.connection
++            if self._conn is None:
++                self._conn = self._create_connection()
++            return self._conn
++
++    def close(self):
++        with self._context.lock:
++            if self._conn is None:
++                return False
++            self._conn.close()
++            self._conn = None
++            return True
 +
 +    @contextlib.contextmanager
 +    def db(self, commit=False, close=False):
-+        # Hold one reentrant lock throughout the scope, so only this thread
-+        # can use the connection or attach callbacks to its transaction.
++        # The file coordinator serializes threads and lets aliases on the
++        # owning thread reuse the current connection and savepoint stack.
++        context = self._context
 +        callbacks = []
 +        try:
-+            with self.lock:
++            with context.lock:
 +                conn = self.conn
 +                cursor = conn.cursor()
-+                self._db_depth += 1
-+                self._close_requested |= close
++                if not context.depth:
++                    context.connection = conn
++                    context.owner = self
++                context.depth += 1
++                if close:
++                    context.close_requests.add(self)
 +                frame = None
 +                savepoint = None
 +                try:
 +                    if commit:
-+                        if self._write_scopes:
-+                            self._savepoint_sequence += 1
-+                            savepoint = 'huey_scope_%d' % self._savepoint_sequence
++                        if context.write_scopes:
++                            context.sequence += 1
++                            savepoint = 'huey_scope_%d' % context.sequence
 +                            cursor.execute('SAVEPOINT ' + savepoint)
 +                        else:
 +                            cursor.execute(self.begin_sql)
 +                        frame = []
-+                        self._write_scopes.append(frame)
++                        context.write_scopes.append(frame)
 +                    try:
 +                        yield cursor
 +                        if frame is not None:
@@ -130,33 +208,40 @@
 +                        raise
 +                    else:
 +                        if frame is not None:
-+                            if len(self._write_scopes) > 1:
-+                                self._write_scopes[-2].extend(frame)
++                            if len(context.write_scopes) > 1:
++                                context.write_scopes[-2].extend(frame)
 +                            else:
-+                                self._committed_callbacks.extend(frame)
++                                context.committed_callbacks.extend(frame)
 +                    finally:
 +                        if frame is not None:
-+                            self._write_scopes.pop()
++                            context.write_scopes.pop()
 +                finally:
 +                    cursor.close()
-+                    self._db_depth -= 1
-+                    if not self._db_depth:
-+                        if self._close_requested:
-+                            self._close_requested = False
-+                            conn.close()
-+                            self._conn = None
-+                        callbacks = self._committed_callbacks
-+                        self._committed_callbacks = []
++                    context.depth -= 1
++                    if not context.depth:
++                        try:
++                            if context.close_requests:
++                                # Close the borrowed connection only after
++                                # every participant's cursor has finished.
++                                context.close_requests.add(context.owner)
++                                for storage in context.close_requests:
++                                    if storage._conn is not None:
++                                        storage._conn.close()
++                                        storage._conn = None
++                        finally:
++                            context.close_requests.clear()
++                            context.connection = context.owner = None
++                            callbacks = context.committed_callbacks
++                            context.committed_callbacks = []
 +        finally:
 +            # Even a surrounding read-only scope may raise after a child
 +            # committed. Those durable notifications must still be delivered.
 +            # No storage lock or live transaction remains here.
-+            for callback in callbacks:
-+                callback()
++            context.notify(callbacks)
  
      def _create_connection(self):
          conn = sqlite3.connect(self.filename, timeout=self._timeout,
-@@ -1001,6 +1071,29 @@
+@@ -1001,6 +1147,29 @@
                  curs.execute('delete from schedule where id in (%s)' %
                               ','.join('?' * len(chunk)), chunk)
              return data
@@ -181,7 +266,7 @@
 +            curs.executemany('delete from schedule where queue = ? and id = ?',
 +                             [(self.name, row_id) for row_id, _ in rows])
 +            tasks = [task for task, _, _ in prepared]
-+            self._write_scopes[-1].append(lambda: notify(tasks))
++            self._context.write_scopes[-1].append(lambda: notify(tasks))
 +        return tasks
  
      def schedule_size(self):
