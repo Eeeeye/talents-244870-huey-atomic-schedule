@@ -170,6 +170,27 @@ class FramedSerializer(Serializer):
         return super().deserialize(data[len(b'framed-v1\0'):])
 
 
+class CallbackSerializer(Serializer):
+    """Real serialization with finite synchronous application hooks."""
+    def __init__(self):
+        super().__init__()
+        self.on_encode = None
+        self.on_decode = None
+
+    def serialize(self, message):
+        callback, self.on_encode = self.on_encode, None
+        if callback is not None:
+            callback(message)
+        return super().serialize(message)
+
+    def deserialize(self, data):
+        message = super().deserialize(data)
+        callback, self.on_decode = self.on_decode, None
+        if callback is not None:
+            callback(message)
+        return message
+
+
 class ForkCheckedConnection(sqlite3.Connection):
     inherited_closes = []
 
@@ -1433,6 +1454,183 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(child['seen'], [('main', 'grandchild-job')])
         self.assertEqual(seen, [])
         self.assertEqual(self.h.storage.queue_size(), 3)
+
+
+    def test_reentrant_deserializer_reserves_large_batch_but_keeps_rows_readable(self):
+        selected = add_batch(self.h, self.task, 507, prefix='claimed')
+        alias, alias_task = make_huey(self.path)
+        self.connections.append(alias)
+        self.h.serializer = CallbackSerializer()
+        events = self.events()
+        alias.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: events.append(item.id))
+        nested = []
+        extra = [alias_task.s(i, id='nested-%d' % i, eta=NOW) for i in range(2)]
+
+        def during_decode(_):
+            self.assertEqual(alias.storage.schedule_size(), 507)
+            self.assertEqual(len(alias.storage.scheduled_items()), 507)
+            nested.append(alias.promote_schedule(NOW))
+            for item in extra:
+                alias.add_schedule(item)
+            self.assertEqual(alias.storage.schedule_size(), 509)
+            nested.append(alias.promote_schedule(NOW))
+            self.assertEqual(alias.storage.schedule_size(), 507)
+            self.assertEqual(alias.storage.queue_size(), 2)
+            self.assertEqual(events, [])
+
+        self.h.serializer.on_decode = during_decode
+        self.assertEqual(self.h.promote_schedule(NOW), 507)
+        self.assertEqual(nested, [0, 2])
+        self.assertCountEqual(task_ids(self.h, self.path),
+                              [item.id for item in selected + extra])
+        self.assertEqual(events, [item.id for item in selected + extra])
+        self.assertEqual(self.h.storage.schedule_size(), 0)
+
+    def test_serializer_reentry_cycle_across_queue_aliases_has_invocation_order(self):
+        left = add_batch(self.h, self.task, 3, prefix='left')
+        right, right_task = make_huey(self.path, name='right')
+        alias, alias_task = make_huey(self.path)
+        self.connections.extend([right, alias])
+        right_jobs = add_batch(right, right_task, 2, prefix='right')
+        self.h.serializer = CallbackSerializer()
+        right.serializer = CallbackSerializer()
+        seen, counts = [], []
+        for h in (self.h, right, alias):
+            h.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: seen.append(item.id))
+        extra = alias_task.s('extra', id='cycle-extra', eta=NOW)
+
+        def inside_right(_):
+            self.assertEqual(alias.promote_schedule(NOW), 0)
+            alias.add_schedule(extra)
+            counts.append(alias.promote_schedule(NOW))
+            self.assertEqual(seen, [])
+
+        def inside_left(_):
+            counts.append(right.promote_schedule(NOW))
+            self.assertEqual(seen, [])
+
+        right.serializer.on_encode = inside_right
+        self.h.serializer.on_encode = inside_left
+        self.assertEqual(self.h.promote_schedule(NOW), 3)
+        self.assertEqual(counts, [1, 2])
+        self.assertEqual(seen, [t.id for t in left + right_jobs + [extra]])
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in left + [extra]])
+        self.assertCountEqual(task_ids(right, self.path, queue='right'), [t.id for t in right_jobs])
+
+    def test_failed_serializer_nested_call_releases_claims_and_notification_position(self):
+        left = add_batch(self.h, self.task, 2, prefix='left')
+        right, right_task = make_huey(self.path, name='right')
+        third, third_task = make_huey(self.path, name='third')
+        self.connections.extend([right, third])
+        right_jobs = add_batch(right, right_task, 2, prefix='right')
+        third_jobs = add_batch(third, third_task, 1, prefix='third')
+        self.h.serializer = CallbackSerializer()
+        right.serializer = CallbackSerializer()
+        seen = []
+        for h in (self.h, right, third):
+            h.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: seen.append(item.id))
+
+        def reject_inner(_):
+            self.assertEqual(third.promote_schedule(NOW), 1)
+            third.storage.incr('rolled-back-counter', 7)
+            raise ValueError('nested preparation rejected')
+
+        def catch_and_retry(_):
+            with self.assertRaises(ValueError):
+                right.promote_schedule(NOW)
+            self.assertEqual(right.storage.schedule_size(), 2)
+            self.assertEqual(third.storage.schedule_size(), 1)
+            self.assertEqual(right.storage.queue_size(), 0)
+            self.assertEqual(third.storage.queue_size(), 0)
+            self.assertEqual(third.storage.incr('rolled-back-counter', 0), 0)
+            self.assertEqual(right.promote_schedule(NOW), 2)
+            self.assertEqual(third.promote_schedule(NOW), 1)
+            self.assertEqual(seen, [])
+
+        right.serializer.on_encode = reject_inner
+        self.h.serializer.on_encode = catch_and_retry
+        self.assertEqual(self.h.promote_schedule(NOW), 2)
+        self.assertEqual(seen, [t.id for t in left + right_jobs + third_jobs])
+        self.assertEqual(sum(h.storage.queue_size() for h in (self.h, right, third)), 5)
+
+    def test_outer_serializer_cancellation_rolls_back_nested_work_only_on_same_file(self):
+        left = add_batch(self.h, self.task, 3, prefix='left')
+        right, right_task = make_huey(self.path, name='right')
+        other_path = self.path.with_name('independent.sqlite')
+        other, other_task = make_huey(other_path)
+        self.connections.extend([right, other])
+        add_batch(right, right_task, 2, prefix='right')
+        independent = add_batch(other, other_task, 1, prefix='independent')
+        before = snapshot(self.path)
+        self.h.serializer = CallbackSerializer()
+        seen, independent_seen = [], []
+        for h in (self.h, right):
+            h.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: seen.append(item.id))
+        other.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: independent_seen.append(item.id))
+
+        def cancel_after_nested(_):
+            self.assertEqual(right.promote_schedule(NOW), 2)
+            right.storage.put_data('transient', b'value')
+            self.h.add_schedule(self.task.s('transient', id='transient', eta=NOW))
+            self.assertEqual(other.promote_schedule(NOW), 1)
+            self.assertEqual(independent_seen, [independent[0].id])
+            raise AbortScope('outer preparation canceled')
+
+        self.h.serializer.on_decode = cancel_after_nested
+        with self.assertRaises(AbortScope):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        self.assertEqual(task_ids(other, other_path), [independent[0].id])
+        self.assertEqual(self.h.promote_schedule(NOW), 3)
+        self.assertEqual(seen, [t.id for t in left])
+        self.assertEqual(right.storage.schedule_size(), 2)
+
+    def test_caught_whole_transaction_abort_during_preparation_cannot_publish_rows(self):
+        selected = add_batch(self.h, self.task, 5, prefix='abort-prepare')
+        alias, _ = make_huey(self.path)
+        self.connections.append(alias)
+        self.h.serializer = CallbackSerializer()
+        seen = self.events()
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute("CREATE TRIGGER abort_from_serializer BEFORE INSERT ON kv "
+                         "BEGIN SELECT RAISE(ROLLBACK, 'abort preparation transaction'); END")
+        before = snapshot(self.path)
+
+        def catch_abort(_):
+            with self.assertRaises(sqlite3.Error):
+                alias.storage.put_data('trigger-abort', b'value')
+
+        self.h.serializer.on_encode = catch_abort
+        with self.assertRaises(Exception):
+            self.h.promote_schedule(NOW)
+        self.assertEqual(snapshot(self.path), before)
+        self.assertEqual(seen, [])
+        with sqlite3.connect(str(self.path)) as conn:
+            conn.execute('DROP TRIGGER abort_from_serializer')
+        self.assertEqual(self.h.promote_schedule(NOW), 5)
+        self.assertEqual(seen, [t.id for t in selected])
+
+    def test_preparation_claims_end_before_postcommit_rowid_reuse(self):
+        selected = add_batch(self.h, self.task, 2, prefix='before-reuse')
+        alias, alias_task = make_huey(self.path)
+        self.connections.append(alias)
+        seen, nested = [], []
+        extra = alias_task.s('reused row id', id='after-reuse', eta=NOW)
+        alias.signal(SIGNAL_ENQUEUED)(lambda signal_name, item: seen.append(item.id))
+
+        def receiver(signal_name, item):
+            seen.append(item.id)
+            if item.id == selected[0].id:
+                alias.add_schedule(extra)
+                nested.append(alias.promote_schedule(NOW))
+
+        self.h.signal(SIGNAL_ENQUEUED)(receiver)
+        self.assertEqual(self.h.promote_schedule(NOW), 2)
+        self.assertEqual(nested, [1])
+        self.assertEqual(seen, [t.id for t in selected + [extra]])
+        self.assertCountEqual(task_ids(self.h, self.path), [t.id for t in selected + [extra]])
+
 
 
 if __name__ == '__main__':

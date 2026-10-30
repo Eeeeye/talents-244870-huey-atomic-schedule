@@ -73,7 +73,7 @@
              finally:
                  cursor.close()
                  if close:
-@@ -881,8 +882,72 @@
+@@ -881,8 +882,73 @@
                  return curs.fetchall()
  
  
@@ -89,6 +89,7 @@
 +        self.sequence = 0
 +        self.close_requests = set()
 +        self.committed_callbacks = []
++        self.preparing_rows = set()
 +        self.dispatch = threading.local()
 +
 +    def notify(self, callbacks):
@@ -146,7 +147,7 @@
      integrity_error = getattr(sqlite3, 'IntegrityError', None)
      sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
      table_kv = ('create table if not exists kv ('
-@@ -915,6 +980,7 @@
+@@ -915,6 +981,7 @@
          self._journal_mode = journal_mode
          self._timeout = timeout  # Busy timeout in seconds, default is 5.
          self._conn_kwargs = kwargs
@@ -154,7 +155,7 @@
  
          # By default Sqlite may reuse rowids when rows are removed. This means
          # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
-@@ -932,6 +998,125 @@
+@@ -932,6 +999,125 @@
          self.to_blob = memoryview
  
          super(SqliteStorage, self).__init__(name, create_tables=create_tables)
@@ -280,7 +281,7 @@
  
      def _create_connection(self):
          conn = sqlite3.connect(self.filename, timeout=self._timeout,
-@@ -1001,6 +1186,29 @@
+@@ -1001,6 +1187,47 @@
                  curs.execute('delete from schedule where id in (%s)' %
                               ','.join('?' * len(chunk)), chunk)
              return data
@@ -296,16 +297,34 @@
 +            curs.execute('select id, data from schedule where '
 +                         'queue = ? and timestamp <= ? order by timestamp, id',
 +                         (self.name, ts.timestamp()))
-+            rows = curs.fetchall()
-+            prepared = [prepare(data) for _, data in rows]
-+            curs.executemany(
-+                'insert into task (queue, data, priority) values (?, ?, ?)',
-+                [(self.name, self.to_blob(data), priority or 0)
-+                 for _, data, priority in prepared])
-+            curs.executemany('delete from schedule where queue = ? and id = ?',
-+                             [(self.name, row_id) for row_id, _ in rows])
-+            tasks = [task for task, _, _ in prepared]
-+            self._context.write_scopes[-1].append(lambda: notify(tasks))
++            context = self._context
++            rows = [(row_id, data) for row_id, data in curs.fetchall()
++                    if (self.name, row_id) not in context.preparing_rows]
++            claimed = {(self.name, row_id) for row_id, _ in rows}
++            context.preparing_rows.update(claimed)
++            tasks = []
++            # Reserve this invocation's notification position before calling
++            # application serialization, which may promote another batch.
++            context.write_scopes[-1].append(lambda: notify(tasks))
++            try:
++                prepared = [prepare(data) for _, data in rows]
++                # Application code may catch a whole-transaction rollback.
++                # Never continue with direct SQL in SQLite autocommit mode.
++                if context.aborted or not curs.connection.in_transaction:
++                    context.aborted = True
++                    raise sqlite3.OperationalError(
++                        'The enclosing SQLite transaction was aborted')
++                curs.executemany(
++                    'insert into task (queue, data, priority) values (?, ?, ?)',
++                    [(self.name, self.to_blob(data), priority or 0)
++                     for _, data, priority in prepared])
++                curs.executemany('delete from schedule where queue = ? and id = ?',
++                                 [(self.name, row_id) for row_id, _ in rows])
++                tasks.extend(task for task, _, _ in prepared)
++            finally:
++                # Release before db() commits and dispatches. A postcommit
++                # receiver may schedule a new row that reuses a deleted id.
++                context.preparing_rows.difference_update(claimed)
 +        return tasks
  
      def schedule_size(self):
